@@ -4,58 +4,164 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - "Griot-Android-Nativo.zip"
-      - ".github/workflows/build-apk.yml"
+      - 'Griot-Android-Nativo.zip'
+      - '.github/workflows/build-apk.yml'
 
 permissions:
   contents: read
 
 jobs:
   build:
+    name: Gerar APK de producao (JavaScript integrado)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
     steps:
-      - name: Baixar arquivos do repositório
+      - name: Baixar arquivos do repositorio
         uses: actions/checkout@v4
 
-      - name: Extrair o projeto
-        run: unzip -q Griot-Android-Nativo.zip -d source
+      - name: Extrair o projeto Android
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f Griot-Android-Nativo.zip || {
+            echo 'ERRO: coloque Griot-Android-Nativo.zip na raiz do repositorio.'
+            exit 1
+          }
+          mkdir -p source
+          unzip -q Griot-Android-Nativo.zip -d source
+
+          # Localiza o projeto independentemente de quantas pastas existam no ZIP.
+          APP_DIR=''
+          while IFS= read -r gradlew; do
+            candidate="$(dirname "$(dirname "$gradlew")")"
+            if [[ -f "$candidate/package.json" ]]; then
+              APP_DIR="$candidate"
+              break
+            fi
+          done < <(find source -type f -path '*/android/gradlew' -not -path '*/node_modules/*')
+
+          if [[ -z "$APP_DIR" ]]; then
+            echo 'ERRO: nao encontrei package.json e android/gradlew no projeto extraido.'
+            find source -maxdepth 4 -type f | head -80 || true
+            exit 1
+          fi
+          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          echo "Projeto encontrado: $APP_DIR"
 
       - name: Configurar Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: source/Griot-Android-Nativo/native-app/package-lock.json
+          node-version: '22'
 
       - name: Configurar Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
-      - name: Instalar dependências
-        run: npm ci
-        working-directory: source/Griot-Android-Nativo/native-app
+      - name: Configurar Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Gerar chave temporária de assinatura
+      - name: Instalar dependencias JavaScript
+        shell: bash
         run: |
-          keytool -genkeypair -v \
-            -keystore native-app/android/app/debug.keystore \
-            -storepass android \
-            -alias androiddebugkey \
-            -keypass android \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
-        working-directory: source/Griot-Android-Nativo
+          set -euo pipefail
+          cd "$APP_DIR"
+          if [[ -f package-lock.json ]]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
 
-      - name: Compilar APK
-        run: ./gradlew assembleDebug
-        working-directory: source/Griot-Android-Nativo/native-app/android
+      - name: Integrar JavaScript no APK (sem depender do Metro)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
+          ENTRY=''
+          for file in index.js index.android.js index.ts index.tsx; do
+            if [[ -f "$file" ]]; then
+              ENTRY="$file"
+              break
+            fi
+          done
+          if [[ -z "$ENTRY" ]]; then
+            echo 'ERRO: nao encontrei o arquivo de entrada (index.js/index.tsx).'
+            exit 1
+          fi
+          mkdir -p android/app/src/main/assets
+          npx --no-install react-native bundle \
+            --platform android \
+            --dev false \
+            --entry-file "$ENTRY" \
+            --bundle-output android/app/src/main/assets/index.android.bundle \
+            --assets-dest android/app/src/main/res
+          test -s android/app/src/main/assets/index.android.bundle
+          echo 'Bundle de producao criado com sucesso.'
+
+      - name: Preparar assinatura de teste instalavel
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
+          # A maioria dos templates React Native ja inclui esta chave de desenvolvimento.
+          # Se ela nao existir, uma chave temporaria sera criada neste build.
+          if [[ ! -f android/app/debug.keystore ]]; then
+            keytool -genkeypair -v \
+              -keystore android/app/debug.keystore \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname 'CN=Android Debug,O=Android,C=US'
+          fi
+          chmod +x android/gradlew
+
+      - name: Compilar APK de producao
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR/android"
+          ./gradlew clean :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Preparar APK para instalacao
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          APK="$(find android/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' | head -1)"
+          if [[ -z "$APK" ]]; then
+            echo 'ERRO: Gradle nao gerou um APK de release.'
+            exit 1
+          fi
+
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          ZIPALIGN="$BUILD_TOOLS/zipalign"
+          DEST="$GITHUB_WORKSPACE/dist/Griot-release.apk"
+
+          if "$APKSIGNER" verify "$APK" >/dev/null 2>&1; then
+            cp "$APK" "$DEST"
+          else
+            echo 'APK sem assinatura: alinhando e assinando com a chave de teste.'
+            "$ZIPALIGN" -f 4 "$APK" "$GITHUB_WORKSPACE/dist/Griot-aligned.apk"
+            "$APKSIGNER" sign \
+              --ks android/app/debug.keystore \
+              --ks-key-alias androiddebugkey \
+              --ks-pass pass:android \
+              --key-pass pass:android \
+              --out "$DEST" \
+              "$GITHUB_WORKSPACE/dist/Griot-aligned.apk"
+            rm "$GITHUB_WORKSPACE/dist/Griot-aligned.apk"
+          fi
+          "$APKSIGNER" verify "$DEST"
+          test -s "$DEST"
+          ls -lh "$DEST"
 
       - name: Disponibilizar APK para download
         uses: actions/upload-artifact@v4
         with:
-          name: griot-apk
-          path: source/Griot-Android-Nativo/native-app/android/app/build/outputs/apk/debug/app-debug.apk
+          name: Griot-Android-APK
+          path: dist/Griot-release.apk
           if-no-files-found: error
           retention-days: 14

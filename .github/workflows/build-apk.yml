@@ -1,0 +1,50 @@
+name: Build Griot Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "Griot-Android-Nativo.zip"
+      - ".github/workflows/build-apk.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar arquivos do repositório
+        uses: actions/checkout@v4
+
+      - name: Extrair o projeto
+        run: unzip -q Griot-Android-Nativo.zip -d source
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: source/Griot-Android-Nativo/native-app/package-lock.json
+
+      - name: Configurar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Instalar dependências
+        run: npm ci
+        working-directory: source/Griot-Android-Nativo/native-app
+
+      - name: Compilar APK
+        run: ./gradlew assembleDebug
+        working-directory: source/Griot-Android-Nativo/native-app/android
+
+      - name: Disponibilizar APK para download
+        uses: actions/upload-artifact@v4
+        with:
+          name: griot-apk
+          path: source/Griot-Android-Nativo/native-app/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
